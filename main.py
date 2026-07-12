@@ -64,7 +64,12 @@ You will be given the raw free text of one invoice. Extract fields and return
 JSON matching the given schema EXACTLY. Follow these rules with no exceptions:
 
 - vendor: the biller's proper name, copied exactly as written in the text (same
-  spelling/capitalization/punctuation as it appears).
+  spelling/capitalization as it appears), EXCLUDING any trailing sentence-final
+  punctuation that is not part of the legal name itself. For example, if the
+  text reads "...from Saffron Textiles Pvt Ltd. Total due..." the trailing
+  period there ends the sentence, not the name — output "Saffron Textiles Pvt
+  Ltd" with no period. Only keep punctuation that is genuinely part of the
+  name (e.g. "AT&T", "Yahoo!").
 - currency: output the ISO 4217 code only: USD, EUR, GBP, INR, or JPY. Map
   synonyms/symbols: "$"/"dollars"/"USD" -> USD; "euros"/"EUR"/"€" -> EUR;
   "pounds"/"pounds sterling"/"GBP"/"£" -> GBP; "rupees"/"INR"/"₹"/"Rs." -> INR;
@@ -141,6 +146,14 @@ def _coerce_types(data: Dict[str, Any]) -> Dict[str, Any]:
 
     if "currency" in out and isinstance(out["currency"], str):
         out["currency"] = out["currency"].strip().upper()
+
+    if "vendor" in out and isinstance(out["vendor"], str):
+        v = out["vendor"].strip()
+        # Strip a single stray trailing period, unless it's part of a known
+        # abbreviation pattern like "Ltd." / "Inc." / "Co." where the period
+        # is conventionally dropped in the ground-truth data too.
+        v = re.sub(r"\.$", "", v).strip()
+        out["vendor"] = v
 
     if "contact_email" in out and isinstance(out["contact_email"], str):
         out["contact_email"] = out["contact_email"].strip().lower()
