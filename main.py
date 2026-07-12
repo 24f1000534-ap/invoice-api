@@ -1,73 +1,65 @@
 """
-Invoice Intelligence — Structured Extraction API
---------------------------------------------------
+Invoice Intelligence — Structured Extraction API (Gemini version)
+-------------------------------------------------------------------
 POST /extract
     Body: {"document_id": "...", "text": "...", "schema": {...}}
     Returns: strict JSON matching the fixed invoice schema.
 
-Deploy this anywhere (Render / Railway / Fly.io / Replit / a VPS) and
-submit the resulting public URL + "/extract" as your endpoint.
-
-Requires an environment variable ANTHROPIC_API_KEY.
+Requires an environment variable GEMINI_API_KEY.
 """
 
 import os
-import json
 import re
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Dict
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import anthropic
+import google.generativeai as genai
 
 app = FastAPI()
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
-MODEL = "claude-sonnet-4-6"
+MODEL_NAME = "gemini-2.0-flash"
 
-# ---------------------------------------------------------------------------
-# The exact output contract. We define this ourselves (rather than trusting
-# whatever "schema" the grader sends) so we always know the required keys,
-# but we still use request["schema"] to double check / merge if provided.
-# ---------------------------------------------------------------------------
-OUTPUT_SCHEMA: Dict[str, Any] = {
-    "type": "object",
+REQUIRED_KEYS = [
+    "vendor", "currency", "total_amount", "invoice_date", "due_in_days",
+    "is_paid", "priority", "contact_email", "line_items", "item_count",
+]
+
+# Gemini's response_schema uses a subset of the OpenAPI/JSON-schema spec.
+RESPONSE_SCHEMA = {
+    "type": "OBJECT",
     "properties": {
-        "vendor": {"type": "string"},
-        "currency": {"type": "string", "enum": ["USD", "EUR", "GBP", "INR", "JPY"]},
-        "total_amount": {"type": "integer"},
-        "invoice_date": {"type": "string"},
-        "due_in_days": {"type": "integer"},
-        "is_paid": {"type": "boolean"},
-        "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
-        "contact_email": {"type": "string"},
+        "vendor": {"type": "STRING"},
+        "currency": {"type": "STRING", "enum": ["USD", "EUR", "GBP", "INR", "JPY"]},
+        "total_amount": {"type": "INTEGER"},
+        "invoice_date": {"type": "STRING"},
+        "due_in_days": {"type": "INTEGER"},
+        "is_paid": {"type": "BOOLEAN"},
+        "priority": {"type": "STRING", "enum": ["low", "normal", "high", "urgent"]},
+        "contact_email": {"type": "STRING"},
         "line_items": {
-            "type": "array",
+            "type": "ARRAY",
             "items": {
-                "type": "object",
+                "type": "OBJECT",
                 "properties": {
-                    "sku": {"type": "string"},
-                    "quantity": {"type": "integer"},
-                    "unit_price": {"type": "integer"},
+                    "sku": {"type": "STRING"},
+                    "quantity": {"type": "INTEGER"},
+                    "unit_price": {"type": "INTEGER"},
                 },
                 "required": ["sku", "quantity", "unit_price"],
             },
         },
-        "item_count": {"type": "integer"},
+        "item_count": {"type": "INTEGER"},
     },
-    "required": [
-        "vendor", "currency", "total_amount", "invoice_date", "due_in_days",
-        "is_paid", "priority", "contact_email", "line_items", "item_count",
-    ],
+    "required": REQUIRED_KEYS,
 }
 
-REQUIRED_KEYS = list(OUTPUT_SCHEMA["properties"].keys())
-
 SYSTEM_PROMPT = """You are an invoice data extraction engine for a finance ERP system.
-You will be given the raw free text of one invoice. Extract fields and call the
-`emit_invoice` tool EXACTLY ONCE with the fully normalized data. Follow these
-rules with no exceptions:
+You will be given the raw free text of one invoice. Extract fields and return
+JSON matching the given schema EXACTLY. Follow these rules with no exceptions:
 
 - vendor: the biller's proper name, copied exactly as written in the text (same
   spelling/capitalization/punctuation as it appears).
@@ -81,7 +73,7 @@ rules with no exceptions:
     * Indian digit grouping: "1,24,800" -> 124800
     * K/M suffix: "12K" -> 12000, "1.2M" -> 1200000
     * spelled-out numbers in words: "twelve thousand four hundred eighty" -> 12480
-  Round to the nearest whole unit if cents/paise are present (e.g. 12,480.50 -> 12480 unless rounding rules differ, use standard rounding).
+  Round to the nearest whole unit if cents/paise are present.
 - invoice_date: normalize to YYYY-MM-DD regardless of the original format
   (e.g. "March 3, 2024", "03/03/2024", "3rd March 2024").
 - due_in_days: an integer number of days from the invoice date until payment
@@ -94,45 +86,47 @@ rules with no exceptions:
   status is not mentioned.
 - priority: one of low, normal, high, urgent, inferred from the tone/wording
   of the invoice (e.g. "URGENT", "immediate attention", "past due" suggest
-  higher priority; routine/standard language is "normal"; no urgency at all
-  and explicitly low-stakes language is "low"). If nothing suggests otherwise,
-  use "normal".
+  higher priority; routine/standard language is "normal"; explicitly
+  low-stakes language is "low"). If nothing suggests otherwise, use "normal".
 - contact_email: the invoice's contact email address, all lowercase.
 - line_items: an array of {sku, quantity, unit_price}, in the SAME ORDER they
   appear in the source text. unit_price is an integer (no currency symbols,
-  no decimals — round to nearest whole unit). quantity is an integer.
-- item_count: the integer count of items in line_items (must equal its length).
+  no decimals). quantity is an integer.
+- item_count: the integer count of line_items (must equal its length).
 
-Return ONLY by calling the emit_invoice tool. Do not include any keys other
-than the ones defined in the tool schema. Do not add commentary.
+Return ONLY the JSON object. No commentary, no markdown fences.
 """
 
-EMIT_TOOL = {
-    "name": "emit_invoice",
-    "description": "Emit the fully normalized, structured invoice data.",
-    "input_schema": OUTPUT_SCHEMA,
-}
+model = genai.GenerativeModel(
+    model_name=MODEL_NAME,
+    system_instruction=SYSTEM_PROMPT,
+    generation_config={
+        "response_mime_type": "application/json",
+        "response_schema": RESPONSE_SCHEMA,
+        "temperature": 0,
+    },
+)
+
+
+def _to_int(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(round(v))
+    if isinstance(v, str):
+        cleaned = re.sub(r"[^\d\-]", "", v)
+        return int(cleaned) if cleaned else 0
+    return v
 
 
 def _coerce_types(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Best-effort coercion in case the model returns numeric strings, etc."""
     out = dict(data)
-
-    def to_int(v):
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, int):
-            return v
-        if isinstance(v, float):
-            return int(round(v))
-        if isinstance(v, str):
-            cleaned = re.sub(r"[^\d\-]", "", v)
-            return int(cleaned) if cleaned else 0
-        return v
 
     for k in ("total_amount", "due_in_days", "item_count"):
         if k in out:
-            out[k] = to_int(out[k])
+            out[k] = _to_int(out[k])
 
     if "currency" in out and isinstance(out["currency"], str):
         out["currency"] = out["currency"].strip().upper()
@@ -148,9 +142,9 @@ def _coerce_types(data: Dict[str, Any]) -> Dict[str, Any]:
         for item in out["line_items"]:
             item = dict(item)
             if "quantity" in item:
-                item["quantity"] = to_int(item["quantity"])
+                item["quantity"] = _to_int(item["quantity"])
             if "unit_price" in item:
-                item["unit_price"] = to_int(item["unit_price"])
+                item["unit_price"] = _to_int(item["unit_price"])
             items.append(item)
         out["line_items"] = items
         out["item_count"] = len(items)
@@ -166,27 +160,15 @@ def _validate_exact_keys(data: Dict[str, Any]) -> bool:
 
 
 def extract_invoice(text: str) -> Dict[str, Any]:
-    messages = [{"role": "user", "content": f"Invoice text:\n\n{text}"}]
+    prompt = f"Invoice text:\n\n{text}"
+    response = model.generate_content(prompt)
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        tools=[EMIT_TOOL],
-        tool_choice={"type": "tool", "name": "emit_invoice"},
-        messages=messages,
-    )
+    raw = response.text
+    data = json.loads(raw)
 
-    tool_block = next(
-        (b for b in response.content if b.type == "tool_use"), None
-    )
-    if tool_block is None:
-        raise ValueError("Model did not return a tool_use block")
-
-    data = _coerce_types(tool_block.input)
+    data = _coerce_types(data)
 
     if not _validate_exact_keys(data):
-        # Drop unexpected keys, fill any missing with sane defaults.
         cleaned = {k: data.get(k) for k in REQUIRED_KEYS}
         data = cleaned
 
