@@ -11,17 +11,19 @@ Requires an environment variable GEMINI_API_KEY.
 import os
 import re
 import json
+import time
 from typing import Any, Dict
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 
 app = FastAPI()
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 REQUIRED_KEYS = [
     "vendor", "currency", "total_amount", "invoice_date", "due_in_days",
@@ -97,15 +99,24 @@ JSON matching the given schema EXACTLY. Follow these rules with no exceptions:
 Return ONLY the JSON object. No commentary, no markdown fences.
 """
 
-model = genai.GenerativeModel(
-    model_name=MODEL_NAME,
-    system_instruction=SYSTEM_PROMPT,
-    generation_config={
-        "response_mime_type": "application/json",
-        "response_schema": RESPONSE_SCHEMA,
-        "temperature": 0,
-    },
-)
+GENERATION_CONFIG = {
+    "response_mime_type": "application/json",
+    "response_schema": RESPONSE_SCHEMA,
+    "temperature": 0,
+}
+
+# Try the primary model first; fall back to a lighter model if the primary
+# is rate-limited (free-tier quotas are tight and shared across models).
+MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+
+_models = {
+    name: genai.GenerativeModel(
+        model_name=name,
+        system_instruction=SYSTEM_PROMPT,
+        generation_config=GENERATION_CONFIG,
+    )
+    for name in MODEL_CANDIDATES
+}
 
 
 def _to_int(v):
@@ -159,9 +170,27 @@ def _validate_exact_keys(data: Dict[str, Any]) -> bool:
     return set(data.keys()) == set(REQUIRED_KEYS)
 
 
+def _call_model_with_retries(prompt: str, max_retries: int = 3):
+    last_err = None
+    for model_name in MODEL_CANDIDATES:
+        gen_model = _models[model_name]
+        for attempt in range(max_retries):
+            try:
+                return gen_model.generate_content(prompt)
+            except google_exceptions.ResourceExhausted as e:
+                last_err = e
+                wait = min(2 ** attempt * 2, 20)
+                time.sleep(wait)
+            except google_exceptions.GoogleAPICallError as e:
+                last_err = e
+                time.sleep(1)
+        # exhausted retries on this model, try the next candidate
+    raise last_err
+
+
 def extract_invoice(text: str) -> Dict[str, Any]:
     prompt = f"Invoice text:\n\n{text}"
-    response = model.generate_content(prompt)
+    response = _call_model_with_retries(prompt)
 
     raw = response.text
     data = json.loads(raw)
@@ -177,7 +206,11 @@ def extract_invoice(text: str) -> Dict[str, Any]:
 
 @app.post("/extract")
 async def extract(request: Request):
-    payload = await request.json()
+    raw_body = await request.body()
+    # Decode leniently in case the client sends non-strict-UTF-8 bytes
+    # (e.g. smart quotes/em-dashes mangled by some terminals).
+    decoded = raw_body.decode("utf-8", errors="replace")
+    payload = json.loads(decoded)
     text = payload.get("text", "")
 
     result = extract_invoice(text)
