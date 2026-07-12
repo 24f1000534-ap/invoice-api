@@ -107,7 +107,7 @@ GENERATION_CONFIG = {
 
 # Try the primary model first; fall back to a lighter model if the primary
 # is rate-limited (free-tier quotas are tight and shared across models).
-MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-3-flash-preview"]
 
 _models = {
     name: genai.GenerativeModel(
@@ -177,6 +177,9 @@ def _call_model_with_retries(prompt: str, max_retries: int = 3):
         for attempt in range(max_retries):
             try:
                 return gen_model.generate_content(prompt)
+            except google_exceptions.NotFound as e:
+                last_err = e
+                break  # this model isn't available at all, try next candidate
             except google_exceptions.ResourceExhausted as e:
                 last_err = e
                 wait = min(2 ** attempt * 2, 20)
